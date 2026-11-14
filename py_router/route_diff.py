@@ -675,6 +675,8 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
                 bus_min_nets: int = defaults.BUS_MIN_NETS,
                 keepout_enabled: bool = False,
                 keepout_layer: str = defaults.KEEPOUT_LAYER,
+                guide_corridor: bool = False,
+                guide_layer: str = defaults.GUIDE_CORRIDOR_LAYER,
                 proximity_heuristic_factor: float = defaults.PROXIMITY_HEURISTIC_FACTOR,
                 stub_proximity_radius: float = defaults.STUB_PROXIMITY_RADIUS,
                 stub_proximity_cost: float = defaults.STUB_PROXIMITY_COST,
@@ -911,7 +913,12 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
     # Load or use provided pcb_data
     if pcb_data is None:
         print(f"Loading {input_file}...")
-        pcb_data = parse_kicad_pcb(input_file, keepout_layer=keepout_layer)
+        pcb_data = parse_kicad_pcb(input_file, keepout_layer=keepout_layer,
+                                   guide_layer=guide_layer)
+        # EXPERIMENT: only an explicit --guide-corridor turns a guide into the
+        # diff-pair centerline. Normal runs are untouched.
+        if guide_corridor and getattr(pcb_data, "guide_paths", None):
+            pcb_data._guide_path = pcb_data.guide_paths[-1]
     else:
         print("Using provided PCB data...")
     # #1279: the board's `sense:<REF>.<PAD>` groups -- protected, or why not.
@@ -3651,6 +3658,11 @@ Examples:
                         help="Keep routed tracks out of polygons drawn on a User layer (issue #27)")
     parser.add_argument("--keepout-layer", type=str, default=defaults.KEEPOUT_LAYER,
                         help=f"User layer the keepout polygons are drawn on (default: {defaults.KEEPOUT_LAYER})")
+    parser.add_argument("--guide-corridor", action="store_true",
+                        help="EXPERIMENT: use a User-layer polyline as the diff-pair centerline "
+                             "instead of A* (diff-pair guide; off by default)")
+    parser.add_argument("--guide-corridor-layer", type=str, default=defaults.GUIDE_CORRIDOR_LAYER,
+                        help=f"User layer the guide polyline is drawn on (default: {defaults.GUIDE_CORRIDOR_LAYER})")
 
     # Stub proximity penalty
     parser.add_argument("--stub-proximity-radius", type=float, default=defaults.STUB_PROXIMITY_RADIUS,
@@ -4049,7 +4061,7 @@ Examples:
 
     # Load PCB to expand wildcards
     print(f"Loading {args.input_file} to expand net patterns...")
-    pcb_data = parse_kicad_pcb(args.input_file)
+    pcb_data = parse_kicad_pcb(args.input_file, guide_layer=args.guide_corridor_layer)
 
     # Combine positional net_patterns and --nets argument
     all_patterns = list(args.net_patterns) if args.net_patterns else []
@@ -4157,6 +4169,8 @@ Examples:
                 bus_min_nets=args.bus_min_nets,
                 keepout_enabled=args.keepout,
                 keepout_layer=args.keepout_layer,
+                guide_corridor=args.guide_corridor,
+                guide_layer=args.guide_corridor_layer,
                 stub_proximity_radius=args.stub_proximity_radius,
                 stub_proximity_cost=args.stub_proximity_cost,
                 via_proximity_cost=args.via_proximity_cost,

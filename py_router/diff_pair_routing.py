@@ -3132,6 +3132,35 @@ def _try_route_direction(src, tgt, pcb_data, config, obstacles, base_obstacles,
         s_gx, s_gy, s_dx, s_dy, s_ang, _ = src_cand
         t_gx, t_gy, t_dx, t_dy, t_ang, _ = tgt_cand
 
+        # EXPERIMENT (2026-11-14): user/placement guide corridor.  A guide
+        # polyline is a centerline spec; when present, use it instead of A*.
+        # This is deliberately opt-in via the private `_guide_path` attribute so
+        # normal KRT runs are byte-identical.
+        guide = getattr(pcb_data, "_guide_path", None)
+        if guide is not None:
+            pts = []
+            for gx_mm, gy_mm in getattr(guide, "points", ()) or ():
+                gx, gy = coord.to_grid(float(gx_mm), float(gy_mm))
+                if not pts or pts[-1] != (gx, gy):
+                    pts.append((gx, gy))
+            if not pts:
+                pts = [coord.to_grid(center_src_x, center_src_y),
+                       coord.to_grid(center_tgt_x, center_tgt_y)]
+            c_src = coord.to_grid(center_src_x, center_src_y)
+            c_tgt = coord.to_grid(center_tgt_x, center_tgt_y)
+            if pts[0] != c_src:
+                pts.insert(0, c_src)
+            if pts[-1] != c_tgt:
+                pts.append(c_tgt)
+            pose_path = []
+            for i, (gx, gy) in enumerate(pts):
+                if i + 1 < len(pts):
+                    theta = direction_to_theta_idx(pts[i + 1][0] - gx, pts[i + 1][1] - gy)
+                else:
+                    theta = direction_to_theta_idx(-t_dx, -t_dy)
+                pose_path.append((gx, gy, theta, src_layer))
+            return pose_path, 0, [], (s_dx, s_dy), (t_dx, t_dy), s_ang, t_ang, []
+
         # During probe, clear previous attempt's cells to keep each attempt independent
         if is_probe_attempt:
             obstacles.clear_allowed_cells()
