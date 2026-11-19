@@ -12,7 +12,8 @@ started scattered, then 6 with each group gathered (`--scattered`,
 `--judge` (6) legal seeds for a judging route, printed and written to
 judge.json beside the boards: those `check_floorplan --intent` grades
 without an error and `check_assembly --baseline` grades buildable first,
-then the fewest such defects, each lot by lowest cost.
+then the fewest such defects (a broken keep-apart pair counting as one),
+each lot by lowest cost.
 `--seeds LIST` places the seeds it lists instead, and names the judged ones
 the same way.
 
@@ -53,8 +54,9 @@ the same way.
    pins), decaps spread over their own group's supply pins,
    each group's gap tree, the halo in front of fine-pitch parts' pads
    (and, with --group-halo-coef, in front of each group's sides),
-   airwires over foreign pads, routing congestion, and the intent's decap
-   limits where it grades them at error -- lowered by simulated
+   airwires over foreign pads, routing congestion, the intent's decap
+   limits where it grades them at error, and, with --keep-apart, the
+   keep-apart rules' gaps (`placement/keep_apart.py`) -- lowered by simulated
    annealing (`placement/simple_anneal.py`), MOVES_PER_PART moves per
    movable part from `--seed`, so the same board, inputs and seed give the
    same placement. A run that leaves a part with no legal pose (a big part
@@ -172,6 +174,14 @@ PAD_REACH_NOTE_MM = 0.3
 #: seeds on two (covg blocking 3.1 -> 0.1, bitaxe) and worse on three (tigard,
 #: argus, librevna), so the default has none.
 ANCHORED_SEEDS = 0
+#: cost per mm^2 a keep-apart pair (`--keep-apart`) is short of its gap: the
+#: overlap penalty's final weight (`simple_anneal.LAM_END`), a designer's rule
+#: held nearly as hard as legality. Fixed, not ramped as the overlap is: the
+#: best state is chosen by the model's cost, so its terms keep one scale for
+#: the whole run. Measured on Orin (562 parts, 2 rules over 20 anchors, seed
+#: 0, 20000 moves, group halo 0.25): at 1000, 4 pairs ended broken (up to
+#: 1.0 mm short); at 10000, 2 (L24, up to 0.5 mm), wire within 0.2% of 1000's.
+KEEP_APART_WEIGHT = 10000.0
 
 import argparse
 import json
@@ -388,6 +398,13 @@ def build(pcb, board, doc, base, args, intent=None, blocks=None, fixed=(),
     _rows = graded_only_warning(intent.arrays if intent is not None else None)
     if _rows:
         print(f"  WARNING: {_rows}")
+    # the keep-apart rules (`placement.keep_apart`), "strangers" read from
+    # the groups as folded above
+    kap = None
+    if getattr(args, 'keep_apart', None):
+        from placement.keep_apart import KeepApart, load as load_keep_apart
+        kap = KeepApart(load_keep_apart(args.keep_apart, pcb.footprints),
+                        [(g['name'], g['refs']) for g in doc['groups']], state.parts)
     model = Model(state, pcb, rails=set(view.rails) | declared_rails, claims=claims,
                   decaps=decaps, supply=supply, decap_pins=decap_pins,
                   groups=groups, congestion_weight=args.congestion_weight,
@@ -402,11 +419,17 @@ def build(pcb, board, doc, base, args, intent=None, blocks=None, fixed=(),
                   claim_limits=limits, claim_limit_weight=args.claim_limit_weight,
                   templates=tmpls, template_weight=args.template_weight,
                   keep_away=ka_rules, group_halo_coef=args.group_halo_coef,
-                  group_halo_weight=args.group_halo_weight)
+                  group_halo_weight=args.group_halo_weight,
+                  keep_apart=kap, keep_apart_weight=getattr(args, 'keep_apart_weight', 0.0))
     if model.gh_on:
         notes.append(f"group halo priced: {len(model._ghg)} group(s), "
                      f"{args.group_halo_coef:g} mm per escaping net, weight "
                      f"{args.group_halo_weight:g}")
+    if kap is not None:
+        notes.append(f"keep_apart priced: {len(kap.rules)} rule(s), {len(kap.anchors)} "
+                     f"anchor(s), {args.keep_apart_weight:g} per mm^2 short of a gap"
+                     + (f"; not on the board's parts: {', '.join(sorted(set(kap.dropped)))}"
+                        if kap.dropped else ""))
     if model.ka:
         notes.append(f"keep_away priced: {len(model.ka)} rule(s) over "
                      f"{len(model._ka_parts)} part(s), {KEEP_AWAY_WEIGHT:g} per mm short "
@@ -456,6 +479,8 @@ def _line(t):
             + (f"{t['decap_broken']} decap limit(s) broken, " if t.get('decap_broken') else "")
             + f"halo {t['halo']:.2f}, "
             + (f"group_halo {t['group_halo']:.2f}, " if 'group_halo' in t else "")
+            + (f"keep_apart {t['keep_apart']:.2f} ({len(t['keep_apart_broken'])} pair(s) "
+               f"broken), " if 'keep_apart' in t else "")
             + f"pad hits {t['pad_hits']:.0f}, congestion {t['congestion']:.2f}, "
             f"groups {t['groups']:.1f}" + (f": {groups}" if groups else "")
             + f", hints {t['hints']:.1f}" + (f": {hints}" if hints else "") + ")")
@@ -825,12 +850,18 @@ def judge_order(reports):
     a courtyard pair it does not model (the mixer's seeds, every one NOT
     BUILDABLE on its potentiometers' bodies). Its assembly count joins the
     floorplan errors. A report written before the assembly grade existed
-    counts 0; one check_assembly could not grade ranks with the ungraded."""
+    counts 0; one check_assembly could not grade ranks with the ungraded.
+
+    A keep-apart pair the seed leaves broken (`--keep-apart`, its
+    `final.keep_apart_broken`) is a defect of the same kind, one per pair:
+    the rule is the designer's, and its price only steers the anneal. A run
+    without rules counts 0."""
     def rank(s):
         e = (reports[s].get('floorplan') or {}).get('errors')
         asm = reports[s].get('assembly')
         b = 0 if asm is None else asm.get('blocking')
-        return (e is None or b is None, (e or 0) + (b or 0),
+        k = len(reports[s]['final'].get('keep_apart_broken') or ())
+        return (e is None or b is None, (e or 0) + (b or 0) + k,
                 reports[s]['final']['cost'], s)
     return sorted((s for s, r in reports.items() if not r.get('illegal')), key=rank)
 
@@ -848,8 +879,10 @@ def seed_findings(summary):
     line: its floorplan errors, its assembly, its far-face parts in a ball
     grid's outer rows and each intent link it leaves past its `max_mm`
     (#1632); '' when there are none."""
+    kab = (summary.get('final') or {}).get('keep_apart_broken') or ()
     return ', '.join(t for t in (
         _fp_text(summary.get('floorplan')), _asm_text(summary.get('assembly')),
+        f"{len(kab)} keep-apart pair(s) broken" if kab else '',
         *(f"{r['outer']} {r['face']} part(s) in {r['bga']}'s outer rows"
           for r in summary.get('bga_field') or () if r['outer']),
         *(f"link {ln['link']} {ln['gap_mm']:.2f} mm, past its {ln['max_mm']:g} mm"
@@ -1024,6 +1057,12 @@ def _name_judged(a, seeds, summaries):
            # whether it is past its max_mm (#1632)
            'links': {str(s): summaries[s].get('links') or []
                      for s in seeds if s in summaries},
+           # each placed seed's broken keep-apart pairs, [rule, anchor,
+           # other, mm] (--keep-apart; ranked as defects by judge_order)
+           **({'keep_apart': {str(s): summaries[s]['final']['keep_apart_broken']
+                              for s in seeds if s in summaries
+                              and 'keep_apart_broken' in summaries[s]['final']}}
+              if getattr(a, 'keep_apart', None) else {}),
            'baseline': (os.path.abspath(a.board) if getattr(a, 'board', None)
                         else None)}
     path = os.path.join(os.path.dirname(a.out.format(seed=seeds[0])), 'judge.json')
@@ -1177,6 +1216,13 @@ def build_parser():
                          "side per net leaving the group by it (default 0: off)")
     ap.add_argument('--group-halo-weight', type=float, default=10.0,
                     help='cost per mm^2 of a group halo shortfall (default 10)')
+    ap.add_argument('--keep-apart', default=None, metavar='FILE',
+                    help="keep-apart rules (JSON, placement/keep_apart.py): anchor parts "
+                         "that keep a gap from named parts, or from every part outside "
+                         "their own groups, the gap moving with the parts (default: none)")
+    ap.add_argument('--keep-apart-weight', type=float, default=KEEP_APART_WEIGHT,
+                    help=f"cost per mm^2 a keep-apart pair is short of its gap (default "
+                         f"{KEEP_APART_WEIGHT:g}: a near-hard rule)")
     ap.add_argument('--rail-weight', type=float, default=0.3,
                     help='per mm of a supply rail\'s tree: less than a signal\'s 1, '
                          'being wide or poured, but not nothing (default 0.3)')
@@ -1402,6 +1448,17 @@ def main(argv=None):
     if a.judge < 0:
         print("place_simple: --judge must be 0 or more", file=sys.stderr)
         return 2
+    if a.keep_apart:
+        from placement.keep_apart import RulesError, load as load_keep_apart
+        try:
+            load_keep_apart(a.keep_apart)
+        except RulesError as ex:
+            print(f"place_simple: --keep-apart {a.keep_apart}: {ex}. Nothing was written.",
+                  file=sys.stderr)
+            return 2
+        if a.keep_apart_weight < 0:
+            print("place_simple: --keep-apart-weight must be 0 or more", file=sys.stderr)
+            return 2
     if not a.seeds:
         if a.seed is None:
             a.seed = 0
@@ -1455,6 +1512,14 @@ def main(argv=None):
             + ". check_groups names every problem in the file. Nothing was written.",
             file=sys.stderr)
         return 2
+    if a.keep_apart:
+        from placement.keep_apart import RulesError, load as load_keep_apart
+        try:
+            load_keep_apart(a.keep_apart, pcb.footprints)
+        except RulesError as ex:
+            print(f"place_simple: --keep-apart {a.keep_apart}: {ex}. Nothing was written.",
+                  file=sys.stderr)
+            return 2
     sources = parse_sources('auto')
     blocks, _problems = floorplan.resolve_blocks(intent, pcb, sources)
     # FACES first: the parts a declaration puts on the other face are

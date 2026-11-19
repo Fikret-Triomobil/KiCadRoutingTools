@@ -26,6 +26,7 @@ runnable tool in the clone with a one-line purpose.
   [hand-join verifier](#hand-join-verifier-check_joinpy)
 - Placement: [placer](#placer-place_simplepy) ·
   [groups checker](#groups-checker-check_groupspy) ·
+  [keep-apart grader](#keep-apart-grader-check_keep_apartpy) ·
   [pose setter](#pose-setter-place_posepy) ·
   [assembly checker](#assembly-checker-check_assemblypy) ·
   [board brief](#board-brief-board_briefpy) ·
@@ -574,6 +575,21 @@ python3 -X utf8 py_tools/check_groups.py board.kicad_pcb --groups groups.json --
   Hints are for the agent to weigh and never fail the check.
 
 Exit 0 placeable (warnings allowed); 2 unreadable input; 4 errors.
+
+## Keep-Apart Grader (`check_keep_apart.py`)
+
+Grades any board -- a human reference or a placer's candidate -- against the
+keep-apart rules `place_simple.py --keep-apart` prices (format and measure in
+`py_placer/placement/README.md`, "The keep-apart rules"), with the same code.
+
+```bash
+python3 -X utf8 py_tools/check_keep_apart.py board.kicad_pcb --rules keep_apart.json     --groups groups.json [--intent intent.json] [--json report.json]
+```
+
+Prints each broken pair as `rule: anchor - other  d mm (gap g mm)`, a negative
+distance for a part under another. `--groups` (folded by `--intent`'s claims,
+as `place_simple` folds them) is needed by a `"strangers"` rule. Exit 0 none
+broken, 2 unreadable input or rules, 4 a pair broken.
 
 ## Pose Setter (`place_pose.py`)
 
