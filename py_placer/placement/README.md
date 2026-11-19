@@ -196,6 +196,7 @@ emptied `clock` group is dropped, and `near` entries that named it point at
 | group contiguity | the spanning tree over a group's courtyards, priced by the gap between neighbours: zero while the group is one contiguous piece, whatever its shape | `--group-weight` (5) |
 | `near` / `apart` / `edge` | the groups file's hints (above) | `--near-weight` (2), `--apart-weight` (5), `--edge-weight` (2) |
 | front halo | room for a fine-pitch part's fan-out: on each side its pads face, a strip `coef x nets leaving by that side` deep; a same-face part inside it pays the shortfall squared | `--halo-weight` (10), `--halo-coef` (0.25 mm per net) |
+| group halo | the front halo for a whole group: on each side of its envelope (the bounding box of its members' courtyards, per face), a strip `coef x the group's nets leaving by that side` deep, along the side's whole length; a same-face part of no concern to the group inside it pays the shortfall squared. Off by default | `--group-halo-weight` (10), `--group-halo-coef` (0: off; mm per net) |
 | decap limits | the intent's `decaps.max_distance_mm` and `max_pin_distance_mm`, where it grades them at error: each decap's distance to its nearest owner (the chips the decap rule above names), and each supply pin's gap to its nearest cap, per mm past the limit, measured as `check_floorplan` measures them. A pin limit wider than the tether search radius (5 mm), which any cap on the rail meets, is priced only up to the radius past it, so the scattered start does not shape the board around it | `--decap-limit-weight` (10) |
 | foreign pads | each tree edge's crossing of another part's pad (through-hole counts twice) | `--pad-weight` (2) |
 | congestion | each 0.5 mm cell's routing overflow squared: demand spread over each net's bounding box against the free area per copper layer | `--congestion-weight` (5), `--track-pitch` (0.33 mm) |
@@ -208,6 +209,19 @@ its pin, a crystal at its oscillator pins) may touch. A decap may touch only on
 the side of the supply pin it is matched to; on the chip's other sides it pays
 like any other part, so the spare decaps of a rail do not park in a signal
 side's fan-out. Everything else packs as tight as legality lets it.
+
+**The group halo** (`--group-halo-coef`, off by default) gives a GROUP the room
+the front halo gives a chip: the gap between blocks follows from what leaves
+them. A group's escape nets are its nets (ground aside) with a pad on a member
+and a pad off the group; each leaves by the side of the group's envelope that
+the line from the envelope's centre to the centroid of its pads off the group
+crosses (none while that centroid lies inside the envelope), so a side keeps a
+strip `coef x its nets` deep. A part reaching into it pays as in the front
+halo, the shortfall capped at the strip's depth; a member, a container and a
+small part wired to a member (4 pads or fewer: its series resistor, its decap)
+pay nothing, nor does a part wholly inside the envelope (the group's
+interior). The cost breakdown, the log's last line and the JSON report it as
+`group_halo` when it is on.
 
 ![U3 with its decaps on its supply pins](../../docs/placement-tigard-qfn.png)
 
