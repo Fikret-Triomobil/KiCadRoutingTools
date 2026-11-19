@@ -63,6 +63,12 @@ this cost by simulated annealing; `place_simple.py` is the CLI.
            above) reaching into a strip on its face pays group_halo_weight x the shortfall
            squared, `_halo_rects`' shape, capped at the strip's depth -- one
            wholly inside the envelope pays nothing (the group's interior).
+         + the keep-apart rules (`--keep-apart FILE`, off without one,
+           `placement.keep_apart`): each anchor part keeps a gap from the
+           parts its rule names (or every part outside its own groups),
+           courtyard to courtyard or, across the board, courtyard to the
+           other's net pads; each pair short of it pays keep_apart_weight x
+           the shortfall squared. The gaps move with the parts.
          + pad_weight x each tree edge's crossings of foreign pads: a pad of
            a part other than the edge's two ends, grown by the clearance, a
            through-hole pad counting twice (it blocks both layers)
@@ -291,6 +297,38 @@ def _gaps(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return np.maximum(gx, 0.0) + np.maximum(gy, 0.0)
 
 
+def conn_rects(pcb, parts, ref, memo, boxes):
+    """The copper rects (k x 4) of `ref`'s connected pads at its live pose,
+    in `pad_globals` order, as `legality.pad_rect` gives them (the same turn
+    of each copper box's offset as `_pad_rects`), memoised on the pose in
+    `memo` ({ref: (pose, rects)}), each pad's box offsets kept in `boxes`.
+    `Model._conn_rects` and `check_keep_apart` read pads through this one."""
+    part = parts[ref]
+    key = (part.x, part.y, part.rot)
+    got = memo.get(ref)
+    if got is not None and got[0] == key:
+        return got[1]
+    hx = boxes.get(ref)
+    if hx is None:
+        from .legality import pad_copper_box
+        hx = boxes[ref] = [
+            (cx - p.global_x, cy - p.global_y, a, b)
+            for p in pcb.footprints[ref].pads if p.net_id > 0
+            for cx, cy, a, b in [pad_copper_box(p)]]
+    odd = abs((part.rot - part.orig_rot) % 180.0 - 90.0) < 1e-6
+    out = []
+    for (x, y, _n), (ox, oy, a, b) in zip(part.pad_globals(), hx):
+        if ox or oy:
+            ox, oy = _turn(ox, oy, part.rot - part.orig_rot)
+            x, y = x + ox, y + oy
+        if odd:
+            a, b = b, a
+        out.append((x - a, y - b, x + a, y + b))
+    val = np.asarray(out, dtype=float).reshape(-1, 4)
+    memo[ref] = (key, val)
+    return val
+
+
 def _at_add(at, p, order, ref):
     """One more pad of `ref` at position `p` in a net's `at` map (a new list,
     never the one the map held): `[(order, ref, count)]` sorted, so its first
@@ -414,7 +452,8 @@ class Model:
                  halo_weight: float = 10.0, claim_limits: Sequence = (),
                  claim_limit_weight: float = 0.0, templates: Sequence = (),
                  template_weight: float = 0.0, keep_away: Sequence = (),
-                 group_halo_coef: float = 0.0, group_halo_weight: float = 10.0):
+                 group_halo_coef: float = 0.0, group_halo_weight: float = 10.0,
+                 keep_apart=None, keep_apart_weight: float = 0.0):
         self.state, self.pcb = state, pcb
         self.halo_coef, self.halo_weight = halo_coef, halo_weight
         self.ghc, self.ghw = group_halo_coef, group_halo_weight
@@ -497,6 +536,12 @@ class Model:
             fr = self.fronts(r)
             self._reach[r] = max((f[0] for f in fr if f), default=0.0)
         self._gh_setup()
+        # the keep-apart rules (`placement.keep_apart.KeepApart`, None: off)
+        self.kap, self.kapw = keep_apart, keep_apart_weight
+        self.kap_on = keep_apart is not None and bool(keep_apart.anchors)
+        if self.kap_on:
+            from .keep_apart import Geometry
+            self._kag = Geometry(state.parts, self._conn_rects)
         self.net_len: Dict[int, float] = {}
         self.net_edges: Dict[int, np.ndarray] = {}
         self._moving = frozenset()
@@ -678,36 +723,10 @@ class Model:
 
     # -- the intent's keep_away[] (#1476) ---------------------------------------
     def _conn_rects(self, ref):
-        """The copper rects (k x 4) of `ref`'s connected pads at its live
-        pose, in `pad_globals` order, as `legality.pad_rect` gives them (the
-        same turn of each copper box's offset as `_pad_rects`), memoised on
-        the pose."""
-        part = self.state.parts[ref]
-        key = (part.x, part.y, part.rot)
-        memo = self.__dict__.setdefault('_crmemo', {})
-        got = memo.get(ref)
-        if got is not None and got[0] == key:
-            return got[1]
-        boxes = self.__dict__.setdefault('_crbox', {})
-        hx = boxes.get(ref)
-        if hx is None:
-            from .legality import pad_copper_box
-            hx = boxes[ref] = [
-                (cx - p.global_x, cy - p.global_y, a, b)
-                for p in self.pcb.footprints[ref].pads if p.net_id > 0
-                for cx, cy, a, b in [pad_copper_box(p)]]
-        odd = abs((part.rot - part.orig_rot) % 180.0 - 90.0) < 1e-6
-        out = []
-        for (x, y, _n), (ox, oy, a, b) in zip(part.pad_globals(), hx):
-            if ox or oy:
-                ox, oy = _turn(ox, oy, part.rot - part.orig_rot)
-                x, y = x + ox, y + oy
-            if odd:
-                a, b = b, a
-            out.append((x - a, y - b, x + a, y + b))
-        val = np.asarray(out, dtype=float).reshape(-1, 4)
-        memo[ref] = (key, val)
-        return val
+        """`conn_rects` of `ref` at its live pose, memoised on the pose."""
+        return conn_rects(self.pcb, self.state.parts, ref,
+                          self.__dict__.setdefault('_crmemo', {}),
+                          self.__dict__.setdefault('_crbox', {}))
 
     def _ka_box(self, ref):
         """The bounding box of `ref`'s keep-away pads at its live pose."""
@@ -1703,6 +1722,91 @@ class Model:
             self._ghn[n] = (refs, idx, X, Y, C)
         self._ghcen.update(newcen)
 
+    # -- the keep-apart rules ---------------------------------------------------
+    # A pair (rule, anchor, other) depends on the two parts' poses alone. The
+    # committed nonzero pairs are kept (`_kpp`) with each part's keys
+    # (`_kpnb`); a move re-prices every pair touching a mover, found in two
+    # indexes of committed boxes -- the parts a rule can reach, by courtyard
+    # and net pads (`_ixa`), and the anchors, by courtyard grown by their
+    # widest gap (`_ixan`) -- plus the movers themselves.
+    def keep_apart_cost(self):
+        """The keep-apart term from scratch and its pairs (`KeepApart.scan`)."""
+        if not self.kap_on:
+            return 0.0, []
+        return self.kap.scan(self._kag, self.kapw)
+
+    def _kap_index(self, r):
+        K, G = self.kap, self._kag
+        if K.other(r):
+            self._ixa.remove(r)
+            self._ixa.insert(r, G.presence(r))
+        if r in K.anchors:
+            c, g = G.crt(r), K.reach[r]
+            self._ixan.remove(r)
+            self._ixan.insert(r, (c[0] - g, c[1] - g, c[2] + g, c[3] + g))
+
+    def _kap_build(self):
+        """The committed nonzero pairs, from scratch (`sync` builds the
+        indexes)."""
+        self._kpp, self._kpnb = {}, {}
+        if not self.kap_on:
+            return
+        _c, rows = self.keep_apart_cost()
+        for i, a, b, _d, v in rows:
+            if v:
+                self._kap_add((i, a, b), v)
+
+    def _kap_add(self, key, v):
+        self._kpp[key] = v
+        self._kpnb.setdefault(key[1], set()).add(key)
+        self._kpnb.setdefault(key[2], set()).add(key)
+
+    def _kap_before(self, R):
+        """The committed pairs touching `R`, summed in key order."""
+        keys = set()
+        for r in R:
+            keys |= self._kpnb.get(r, set())
+        return sum(self._kpp[k] for k in sorted(keys))
+
+    def _kap_local(self, R):
+        """Every nonzero pair touching `R` at the live poses, `{(rule,
+        anchor, other): cost}`: a moved anchor against the parts near its
+        grown courtyard and the other movers, a moved part against the
+        anchors near it that stand."""
+        K, G, w = self.kap, self._kag, self.kapw
+        Rs = set(R)
+        movers = {b for b in Rs if K.other(b)}
+        out = {}
+        for r in R:
+            if r in K.anchors:
+                c, g = G.crt(r), K.reach[r]
+                near = self._ixa.query((c[0] - g, c[1] - g, c[2] + g, c[3] + g)) | movers
+                for b in sorted(near):
+                    if b != r:
+                        for i, _d, v in K.pair(r, b, G, w):
+                            if v:
+                                out[(i, r, b)] = v
+            if K.other(r):
+                for a in sorted(self._ixan.query(G.presence(r)) - Rs):
+                    for i, _d, v in K.pair(a, r, G, w):
+                        if v:
+                            out[(i, a, r)] = v
+        return out
+
+    def _kap_commit(self, pend):
+        """Write a kept move's pairs: every committed pair touching a mover
+        out, the move's nonzero pairs in."""
+        R, out = pend
+        for r in R:
+            for k in list(self._kpnb.get(r, ())):
+                self._kpp.pop(k, None)
+                for q in (k[1], k[2]):
+                    s = self._kpnb.get(q)
+                    if s is not None:
+                        s.discard(k)
+        for k in sorted(out):
+            self._kap_add(k, out[k])
+
     def _grid_edges(self):
         g = getattr(self, '_ge', None)
         if g is None or g[0] != (self._nx, self._ny, self.cell):
@@ -1976,6 +2080,11 @@ class Model:
                 'cost': cost}
         if self.gh_on:      # off: the breakdown as it was
             out['group_halo'] = gh
+        if self.kap_on:     # likewise
+            kc, rows = self.keep_apart_cost()
+            out['cost'] += kc
+            out['keep_apart'] = kc
+            out['keep_apart_broken'] = self.kap.broken(rows)
         return out
 
     # -- the intent's decap limits ---------------------------------------------
@@ -2387,6 +2496,8 @@ class Model:
         self._ixp = SpatialIndex()
         self._ixh = SpatialIndex()      # the parts with a halo alone
         self._ixk = SpatialIndex()      # the keep-away parts, by their pads' box
+        self._ixa = SpatialIndex(cell=4.0)      # keep-apart: the parts a rule reaches
+        self._ixan = SpatialIndex(cell=4.0)     # ... and its anchors, grown by their gap
         # each part's committed rect, row = `_pid` (the anneal's overlap)
         self._CR = np.zeros((len(self.state.parts), 4))
         self._npads = {}
@@ -2476,6 +2587,7 @@ class Model:
             self._po.setdefault(pid, {})[n] = w
         self._limits_all()
         self._gh_build()
+        self._kap_build()
         self._pend = None
 
     def halo_pair_fast(self, a, b):
@@ -2514,6 +2626,8 @@ class Model:
         if r in self._ka_parts:
             self._ixk.remove(r)
             self._ixk.insert(r, self._ka_box(r))
+        if self.kap_on:
+            self._kap_index(r)
         rects, wts, nets, pids = self._pad_rows(r)
         k = len(rects)
         base = self._prow.get((r, 0))
@@ -2653,6 +2767,8 @@ class Model:
         self._lim_commit(pend)
         if pend.get('gh') is not None:
             self._gh_commit(pend['gh'])
+        if pend.get('kap') is not None:
+            self._kap_commit(pend['kap'])
         self._pend = None
 
     # -- local pricing of a set of moved parts --------------------------------
@@ -2714,6 +2830,8 @@ class Model:
                    + self.tw * tmpl)
             if self.gh_on:
                 out += self._gh_before(R)
+            if self.kap_on:
+                out += self._kap_before(R)
             return out
         ccl = {id(c): self.claim_cost(c) for c in cl}
         cco = {id(c): self.claim_over(c) for c in cl}
@@ -2752,6 +2870,9 @@ class Model:
             pend['lim'] = self._lim_local(ls, R)
             lim = sum(self._over_limit(i, v) for i, v in pend['lim'][0].items())
         gh, pend['gh'] = self._gh_local(R) if self.gh_on else (0.0, None)
+        if self.kap_on:
+            kap = self._kap_local(R)
+            pend['kap'] = (R, kap)
         self._pend = pend
         self._moving = frozenset()
         out = (wire + self.cw * cross + self.kw * claims + self.dw * dec
@@ -2762,6 +2883,8 @@ class Model:
                + self.tw * sum(ctp.values()))
         if self.gh_on:
             out += gh
+        if self.kap_on:
+            out += sum(kap[k] for k in sorted(kap))
         return out
 
     def _group_names(self, gr):

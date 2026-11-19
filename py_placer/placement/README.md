@@ -197,6 +197,7 @@ emptied `clock` group is dropped, and `near` entries that named it point at
 | `near` / `apart` / `edge` | the groups file's hints (above) | `--near-weight` (2), `--apart-weight` (5), `--edge-weight` (2) |
 | front halo | room for a fine-pitch part's fan-out: on each side its pads face, a strip `coef x nets leaving by that side` deep; a same-face part inside it pays the shortfall squared | `--halo-weight` (10), `--halo-coef` (0.25 mm per net) |
 | group halo | the front halo for a whole group: on each side of its envelope (the bounding box of its members' courtyards, per face), a strip `coef x the group's nets leaving by that side` deep, along the side's whole length; a same-face part of no concern to the group inside it pays the shortfall squared. Off by default | `--group-halo-weight` (10), `--group-halo-coef` (0: off; mm per net) |
+| keep-apart rules | the rules file's gaps (`placement/keep_apart.py`): each anchor part against the parts its rule names, or every part outside its own groups (`"strangers"`), measured courtyard to courtyard or courtyard to the other part's net pads by whether the two stand on one face; a pair short of its gap pays the shortfall squared. Off without a file | `--keep-apart-weight` (10000), `--keep-apart FILE` |
 | decap limits | the intent's `decaps.max_distance_mm` and `max_pin_distance_mm`, where it grades them at error: each decap's distance to its nearest owner (the chips the decap rule above names), and each supply pin's gap to its nearest cap, per mm past the limit, measured as `check_floorplan` measures them. A pin limit wider than the tether search radius (5 mm), which any cap on the rail meets, is priced only up to the radius past it, so the scattered start does not shape the board around it | `--decap-limit-weight` (10) |
 | foreign pads | each tree edge's crossing of another part's pad (through-hole counts twice) | `--pad-weight` (2) |
 | congestion | each 0.5 mm cell's routing overflow squared: demand spread over each net's bounding box against the free area per copper layer | `--congestion-weight` (5), `--track-pitch` (0.33 mm) |
@@ -222,6 +223,29 @@ small part wired to a member (4 pads or fewer: its series resistor, its decap)
 pay nothing, nor does a part wholly inside the envelope (the group's
 interior). The cost breakdown, the log's last line and the JSON report it as
 `group_halo` when it is on.
+
+**The keep-apart rules** (`--keep-apart FILE`, off without one) are
+distances that move with the parts, where an intent keep-out is a fixed area:
+a DC-DC regulator's parts kept 5 mm from every connector whose cable leaves
+the box, under it or beside it on either face; a switching coil kept 1.27 mm
+from every part outside its own regulator group, courtyard to courtyard on
+its face and, across the board, from the other part's net pads (a body or a
+net-less mechanical pad may stand there). Each rule names its anchors
+(`parts`), what they keep away from (`from`: refs, or `"strangers"`, read from
+the groups as folded), its `gap_mm` and a measure per face relation
+(`same_face`, `opposite_face`: `courtyard`, `net_pads` or `none`); the file is
+refused on any key it does not know. A gap is the signed distance between
+rectangles (the shallower penetration, negative, when they overlap), the
+shortfall capped 25 mm inside (no flat price under a large part, where the
+anneal would find no way out), priced at the weight per mm^2 -- 10000, the
+overlap penalty's final weight, so the rule holds nearly as hard as
+legality. A pair more than 0.01 mm short is BROKEN:
+the cost breakdown, the log's last line and the JSON report the term as
+`keep_apart` and the pairs as `keep_apart_broken` (`[rule, anchor, other,
+mm]`); a run of several seeds ranks each broken pair as a defect beside the
+floorplan errors (`judge_order`) and lists them in judge.json's
+`keep_apart`. `py_tools/check_keep_apart.py` grades any board with the same
+measure.
 
 ![U3 with its decaps on its supply pins](../../docs/placement-tigard-qfn.png)
 
