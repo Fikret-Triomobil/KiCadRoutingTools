@@ -50,6 +50,19 @@ this cost by simulated annealing; `place_simple.py` is the CLI.
            (`_offside_halo`); a bigger one wired to
            it (a header its signals go to) leaves the fan-out room all the
            same.
+         + the group halo (`--group-halo-coef`, off at 0): the halo above
+           for a GROUP. Its envelope, per board face, is the bounding box of
+           the courtyards of its members on that face; its escape nets are
+           the nets (ground aside) with a pad on a member and a pad off the
+           group, each leaving by the side of the envelope the line from the
+           envelope's centre to the centroid of its pads off the group
+           crosses (none while that centroid lies inside the envelope). Each
+           side keeps a strip `group_halo_coef x its escape nets` deep along
+           its whole length; a part of no other concern to the group (not a
+           member, not a container, not a small part wired to a member as
+           above) reaching into a strip on its face pays group_halo_weight x the shortfall
+           squared, `_halo_rects`' shape, capped at the strip's depth -- one
+           wholly inside the envelope pays nothing (the group's interior).
          + pad_weight x each tree edge's crossings of foreign pads: a pad of
            a part other than the edge's two ends, grown by the clearance, a
            through-hole pad counting twice (it blocks both layers)
@@ -400,9 +413,11 @@ class Model:
                  hints: Sequence[Dict] = (), halo_coef: float = 0.25,
                  halo_weight: float = 10.0, claim_limits: Sequence = (),
                  claim_limit_weight: float = 0.0, templates: Sequence = (),
-                 template_weight: float = 0.0, keep_away: Sequence = ()):
+                 template_weight: float = 0.0, keep_away: Sequence = (),
+                 group_halo_coef: float = 0.0, group_halo_weight: float = 10.0):
         self.state, self.pcb = state, pcb
         self.halo_coef, self.halo_weight = halo_coef, halo_weight
+        self.ghc, self.ghw = group_halo_coef, group_halo_weight
         self.hints = [h for h in hints if h['weight'] > 0]
         self.inner = tuple(state.usable)
         self.cw, self.kw, self.dw, self.gw = (crossing_weight, claim_weight,
@@ -481,6 +496,7 @@ class Model:
                 self._fine.add(r)
             fr = self.fronts(r)
             self._reach[r] = max((f[0] for f in fr if f), default=0.0)
+        self._gh_setup()
         self.net_len: Dict[int, float] = {}
         self.net_edges: Dict[int, np.ndarray] = {}
         self._moving = frozenset()
@@ -1278,6 +1294,415 @@ class Model:
                 total += self.halo_pair(a, b)
         return total
 
+    # -- the group halo ---------------------------------------------------------
+    # A group's fronts are `((face, envelope, (W, E, N, S) depths), ...)`, one
+    # per board face a member occupies. They read the members' rects and, per
+    # escape net, the centroid of its pads off the group: kept per net as one
+    # row of pad sums per part (`_ghn`), so a move re-sums only its own nets'
+    # rows, and the same rows summed the same way give `total`'s value to the
+    # bit.
+    def _gh_setup(self):
+        """The group halo's fixed data: per group its members, its faces
+        (members and escape nets on each), the parts it never charges; per
+        part the groups it is a member of (`_ghmem`) and those whose escape
+        nets it is on, off the group (`_ghesc`)."""
+        st = self.state
+        P = st.parts
+        self.gh_on = self.ghc > 0 and self.ghw > 0 and bool(self.groups)
+        self._ghg, self._ghnets = [], set()
+        self._ghmem: Dict[str, List[int]] = {}
+        self._ghesc: Dict[str, Dict[int, List[int]]] = {}
+        if not self.gh_on:
+            return
+        caps = set(self.decap_pins) | {c for c, _n in self.decaps}
+        for gi, (_name, members) in enumerate(self.groups):
+            M = set(members)
+            mnets = {n for r in M for n in P[r].nets}
+            esc = sorted(n for n in mnets if n and n not in self.ground
+                         and any(r not in M for r in st.net_refs.get(n, ())))
+            faces = []
+            for f in sorted({s for r in M for s in P[r].sides}):
+                mem = [r for r in members if f in P[r].sides]
+                fn = {n for r in mem for n in P[r].nets}
+                faces.append((f, mem, [n for n in esc if n in fn], set(mem)))
+            # a small part wired to a member is meant to touch it (`halo_pair`)
+            sig = mnets & self.signal
+            skip = set(st.container_refs)
+            for b, pb in P.items():
+                if b in M or pb.pin_count > HALO_SMALL_PADS:
+                    continue
+                if set(pb.nets) & sig or (b in caps and any(self.wired(m, b) for m in M)):
+                    skip.add(b)
+            self._ghg.append({'M': M, 'faces': faces, 'esc': esc, 'skip': skip})
+            self._ghnets.update(esc)
+            for r in sorted(M):
+                self._ghmem.setdefault(r, []).append(gi)
+            for n in esc:
+                for r in st.net_refs.get(n, ()):
+                    if r not in M:
+                        self._ghesc.setdefault(r, {}).setdefault(gi, []).append(n)
+
+    def _gh_rows(self, ref):
+        """`{net: [sum x, sum y]}` of `ref`'s pads on the escape nets, live."""
+        out: Dict[int, List[float]] = {}
+        nets = self._ghnets
+        for x, y, n in self.state.parts[ref].pad_globals():
+            if n in nets:
+                s = out.get(n)
+                if s is None:
+                    out[n] = [x, y]
+                else:
+                    s[0] += x
+                    s[1] += y
+        return out
+
+    def _gh_tables(self):
+        """From the live poses: per escape net `(refs, row of ref, X, Y, C)`
+        (each part's pad sums and pad count on it), and per (group, net) the
+        rows off the group and their pad count."""
+        st = self.state
+        rows = {r: self._gh_rows(r) for r in sorted(st.parts)}
+        nets = {}
+        for n in sorted(self._ghnets):
+            refs = sorted(r for r in st.net_refs.get(n, ()) if n in rows.get(r, ()))
+            cnt = [sum(1 for _x, _y, m in st.parts[r].pad_globals() if m == n) for r in refs]
+            nets[n] = (refs, {r: i for i, r in enumerate(refs)},
+                       np.asarray([rows[r][n][0] for r in refs], dtype=float),
+                       np.asarray([rows[r][n][1] for r in refs], dtype=float),
+                       np.asarray(cnt, dtype=float))
+        out = {}
+        for gi, g in enumerate(self._ghg):
+            for n in g['esc']:
+                refs, _idx, _X, _Y, C = nets[n]
+                oi = np.asarray([i for i, r in enumerate(refs) if r not in g['M']], dtype=int)
+                out[(gi, n)] = (oi, float(C[oi].sum()))
+        return nets, out
+
+    def _gh_cen(self, gi, n, X, Y):
+        """Escape net `n`'s centroid off group `gi` from its rows `X`, `Y`."""
+        oi, c = self._gho[(gi, n)]
+        if c <= 0:
+            return None
+        return (float(X[oi].sum()) / c, float(Y[oi].sum()) / c)
+
+    def _gh_fronts(self, gi, cen, rects):
+        """Group `gi`'s fronts: `cen(n)` an escape net's centroid off the
+        group (None: no pads off it), `rects(members)` their rects (k x 4).
+        A net leaves by the side the line from the envelope's centre to its
+        centroid crosses (`pad_fronts`' rule, the centroid for the pad).
+        Returns `(fronts, sides)`, the sides per face as `{net: side}`."""
+        out, sides = [], []
+        for f, mem, nets, _mset in self._ghg[gi]['faces']:
+            A = rects(mem)
+            env = (float(A[:, 0].min()), float(A[:, 1].min()),
+                   float(A[:, 2].max()), float(A[:, 3].max()))
+            sd = {n: self._gh_side(env, cen(n)) for n in nets}
+            out.append(self._gh_front(f, env, sd))
+            sides.append(sd)
+        return tuple(out), tuple(sides)
+
+    def _gh_front(self, f, env, sd):
+        k = [0, 0, 0, 0]
+        for q in sd.values():
+            if q >= 0:
+                k[q] += 1
+        return (f, env, tuple(self.ghc * q for q in k))
+
+    def _gh_fronts_moved(self, gi, cen, Rs, nets_moved):
+        """`_gh_fronts` of group `gi` after a move of `Rs`: a face whose
+        envelope stands re-sides only `nets_moved` (the nets whose centroid
+        off the group the move shifted), from the committed sides."""
+        old_fr, old_sd = self._ghf[gi], self._ghs[gi]
+        out, sides = [], []
+        for fi, (f, mem, nets, mset) in enumerate(self._ghg[gi]['faces']):
+            env = old_fr[fi][1]
+            if not mset.isdisjoint(Rs):
+                A = self._rects(mem, Rs)
+                env = (float(A[:, 0].min()), float(A[:, 1].min()),
+                       float(A[:, 2].max()), float(A[:, 3].max()))
+            if env == old_fr[fi][1]:
+                sd, new = old_sd[fi], None
+                for n in nets_moved:
+                    if n in sd:
+                        q = self._gh_side(env, cen(n))
+                        if q != sd[n]:
+                            if new is None:
+                                new = dict(sd)
+                            new[n] = q
+                if new is None:
+                    out.append(old_fr[fi])
+                    sides.append(sd)
+                    continue
+                sd = new
+            else:
+                sd = {n: self._gh_side(env, cen(n)) for n in nets}
+            out.append(self._gh_front(f, env, sd))
+            sides.append(sd)
+        return tuple(out), tuple(sides)
+
+    @staticmethod
+    def _gh_side(env, c):
+        """The side (0-3: W, E, N, S) of `env` a net leaves by toward its
+        centroid `c` off the group; -1 for none (no centroid, or one inside
+        the envelope)."""
+        if c is None:
+            return -1
+        hw, hh = (env[2] - env[0]) / 2.0, (env[3] - env[1]) / 2.0
+        u = (c[0] - (env[0] + env[2]) / 2.0) / hw if hw > 1e-9 else 0.0
+        v = (c[1] - (env[1] + env[3]) / 2.0) / hh if hh > 1e-9 else 0.0
+        if max(abs(u), abs(v)) <= 1.0:
+            return -1
+        if abs(u) >= abs(v):
+            return 0 if u < 0 else 1
+        return 2 if v < 0 else 3
+
+    @staticmethod
+    def _gh_strips(env, D):
+        """The strips of fronts `D` in front of envelope `env`: `(side,
+        rect)` for each side with a depth, each spanning its side's length."""
+        x0, y0, x1, y1 = env
+        out = []
+        if D[0]:
+            out.append((0, (x0 - D[0], y0, x0, y1)))
+        if D[1]:
+            out.append((1, (x1, y0, x1 + D[1], y1)))
+        if D[2]:
+            out.append((2, (x0, y0 - D[2], x1, y0)))
+        if D[3]:
+            out.append((3, (x0, y1, x1, y1 + D[3])))
+        return out
+
+    def _gh_rect(self, env, D, rb):
+        """`_halo_rects` of a group envelope `env` with fronts `D` (W, E, N,
+        S depths, each spanning its side's length) against a part presenting
+        `rb`, which has no fronts of its own here; the shortfall capped at
+        the depth that asks it, nothing for a part wholly inside `env`.
+        `_gh_pair` asks it only of a part reaching into a strip."""
+        if rb[0] >= env[0] and rb[1] >= env[1] and rb[2] <= env[2] and rb[3] <= env[3]:
+            return 0.0
+        short, cap = float('inf'), 0.0
+        for lo, hi, olo, ohi, k in ((0, 2, 1, 3, 0), (1, 3, 0, 2, 2)):
+            if env[lo] + env[hi] <= rb[lo] + rb[hi]:
+                gap, d = rb[lo] - env[hi], D[k + 1]
+            else:
+                gap, d = env[lo] - rb[hi], D[k]
+            need = d if d > 0 and env[olo] < rb[ohi] and env[ohi] > rb[olo] else 0.0
+            cap = max(cap, need)
+            short = min(short, need - gap)
+        if cap <= 0 or short <= 0:
+            return 0.0
+        short = min(short, cap)
+        return self.ghw * short * short
+
+    def _gh_pair(self, gi, fr, b):
+        """Part `b` against group `gi` at fronts `fr`: the worst face they
+        share where `b` reaches into a strip; 0 for a member and the parts
+        the group never charges."""
+        g = self._ghg[gi]
+        if b in g['M'] or b in g['skip']:
+            return 0.0
+        pb = self.state.parts[b]
+        rb = None
+        worst = 0.0
+        for f, env, D in fr:
+            if f not in pb.sides or not (D[0] or D[1] or D[2] or D[3]):
+                continue
+            if rb is None:
+                rb = pb.rect()
+            for _s, q in self._gh_strips(env, D):
+                if rb[2] > q[0] and rb[0] < q[2] and rb[3] > q[1] and rb[1] < q[3]:
+                    worst = max(worst, self._gh_rect(env, D, rb))
+                    break
+        return worst
+
+    def group_halo_cost(self):
+        """The group halo from scratch: every group's fronts at the live
+        poses against every part, each (group, part) pair once."""
+        if not self.gh_on:
+            return 0.0
+        st = self.state
+        nets, self._gho = self._gh_tables()
+        names = sorted(st.parts)
+        total = 0.0
+        for gi in range(len(self._ghg)):
+            fr, _sd = self._gh_fronts(
+                gi, lambda n, gi=gi: self._gh_cen(gi, n, nets[n][2], nets[n][3]),
+                lambda mem: np.asarray([st.parts[r].rect()[:4] for r in mem], dtype=float))
+            for b in names:
+                total += self._gh_pair(gi, fr, b)
+        return total
+
+    def _gh_build(self):
+        """The committed group halo: the net tables, each group's fronts and
+        their strips' index (`_ixg`, keyed (group, face, side)), and the
+        nonzero (group, part) pairs."""
+        self._ghp, self._ghnb_g, self._ghnb_b = {}, {}, {}
+        self._ghf, self._ghs, self._ghcen = [], [], {}
+        self._ixg = SpatialIndex(cell=4.0)
+        if not self.gh_on:
+            return
+        self._ghn, self._gho = self._gh_tables()
+        for gi, g in enumerate(self._ghg):
+            for n in g['esc']:
+                self._ghcen[(gi, n)] = self._gh_cen(gi, n, self._ghn[n][2], self._ghn[n][3])
+            fr, sd = self._gh_fronts(gi, lambda n, gi=gi: self._ghcen[(gi, n)],
+                                     lambda mem: self._rects(mem, frozenset()))
+            self._ghf.append(fr)
+            self._ghs.append(sd)
+            self._gh_index(gi, None, fr)
+            self._ghnb_g[gi] = set()
+            for b, v in self._gh_near_pairs(gi, fr, frozenset()).items():
+                self._ghp[(gi, b)] = v
+                self._ghnb_g[gi].add(b)
+                self._ghnb_b.setdefault(b, set()).add(gi)
+
+    def _gh_index(self, gi, old, new):
+        for fi in range(len(old or ())):
+            for side in range(4):
+                self._ixg.remove((gi, fi, side))
+        for fi, (_f, env, D) in enumerate(new):
+            for side, q in self._gh_strips(env, D):
+                self._ixg.insert((gi, fi, side), q)
+
+    def _gh_near_pairs(self, gi, fr, R):
+        """Group `gi`'s nonzero pairs at fronts `fr`: the parts the committed
+        index finds in a strip, and the movers `R` (the index holds their
+        old rects)."""
+        near = set(R)
+        for _f, env, D in fr:
+            for _s, q in self._gh_strips(env, D):
+                near |= self._ixp.query(q)
+        out = {}
+        for b in sorted(near):
+            v = self._gh_pair(gi, fr, b)
+            if v:
+                out[b] = v
+        return out
+
+    def _gh_dirty(self, R):
+        """The groups a move of `R` moves a member of."""
+        return sorted({gi for r in R for gi in self._ghmem.get(r, ())})
+
+    def _gh_before(self, R):
+        """The committed group halo a move of `R` can change: every pair of
+        each group it moves a member of, and `R`'s pairs with the others (a
+        group whose fronts the move turns through its escape nets alone is
+        priced as a change, in `_gh_local`)."""
+        gd = self._gh_dirty(R)
+        total = 0.0
+        for gi in gd:
+            for b in sorted(self._ghnb_g[gi]):
+                total += self._ghp[(gi, b)]
+        gds = set(gd)
+        for r in R:
+            for gi in sorted(self._ghnb_b.get(r, ())):
+                if gi not in gds:
+                    total += self._ghp[(gi, r)]
+        return total
+
+    def _gh_local(self, R):
+        """`_gh_before`'s pairs at the live poses, plus the change of each
+        group whose fronts the move turns through its escape nets alone, as
+        `(value, pending)`."""
+        st = self.state
+        Rs = frozenset(R)
+        gms = set(self._gh_dirty(R))
+        # the groups whose centroids off them the move shifts, net by net
+        moved: Dict[int, Set[int]] = {}
+        for r in R:
+            for gi, nets in self._ghesc.get(r, {}).items():
+                moved.setdefault(gi, set()).update(nets)
+        live = {r: self._gh_rows(r) for r in R}
+        tabs = {}
+        for n in sorted({n for r in R for n in live[r]}):
+            _refs, idx, X, Y, _C = self._ghn[n]
+            X, Y = X.copy(), Y.copy()
+            for r in R:
+                s = live[r].get(n)
+                if s is not None:
+                    X[idx[r]], Y[idx[r]] = s
+            tabs[n] = (X, Y)
+        newcen = {}
+
+        def cen(gi, n):
+            if n not in moved.get(gi, ()):
+                return self._ghcen[(gi, n)]
+            c = newcen.get((gi, n), False)
+            if c is False:
+                t = tabs[n]
+                c = newcen[(gi, n)] = self._gh_cen(gi, n, t[0], t[1])
+            return c
+        total = 0.0
+        groups, sides = {}, {}
+        for gi in sorted(gms | set(moved)):
+            fr, sd = self._gh_fronts_moved(gi, lambda n, gi=gi: cen(gi, n), Rs,
+                                           sorted(moved.get(gi, ())))
+            if sd is not self._ghs[gi]:
+                sides[gi] = sd
+            same = fr == self._ghf[gi]
+            if gi not in gms:
+                if same:
+                    continue        # its pairs stand; the movers' are priced below
+                pairs = self._gh_near_pairs(gi, fr, Rs)
+                for b in sorted(self._ghnb_g[gi]):
+                    if b not in Rs:     # not in `_gh_before`: priced as the change
+                        total -= self._ghp[(gi, b)]
+            elif same:
+                # the same fronts: only the movers' pairs change
+                pairs = {b: self._ghp[(gi, b)] for b in self._ghnb_g[gi] if b not in Rs}
+                for r in R:
+                    v = self._gh_pair(gi, fr, r)
+                    if v:
+                        pairs[r] = v
+            else:
+                pairs = self._gh_near_pairs(gi, fr, Rs)
+            groups[gi] = (fr, pairs)
+            for b in sorted(pairs):
+                total += pairs[b]
+        whole = set(groups)
+        mine = {}
+        for r in R:
+            rr = st.parts[r].rect()
+            for gi in sorted({k[0] for k in self._ixg.query(rr[:4])} - whole):
+                v = self._gh_pair(gi, self._ghf[gi], r)
+                if v:
+                    mine[(gi, r)] = v
+                    total += v
+        return total, (R, whole, groups, sides, mine, tabs, newcen)
+
+    def _gh_commit(self, pend):
+        """Write a kept move's group halo: the groups whose pairs it priced
+        whole, the movers' pairs with the others, and the sides, centroids
+        and net rows it changed."""
+        R, whole, groups, sides, mine, tabs, newcen = pend
+        for gi, (fr, pairs) in groups.items():
+            for b in self._ghnb_g[gi]:
+                self._ghp.pop((gi, b), None)
+                self._ghnb_b[b].discard(gi)
+            self._ghnb_g[gi] = set(pairs)
+            for b, v in pairs.items():
+                self._ghp[(gi, b)] = v
+                self._ghnb_b.setdefault(b, set()).add(gi)
+            if fr != self._ghf[gi]:
+                self._gh_index(gi, self._ghf[gi], fr)
+                self._ghf[gi] = fr
+        for gi, sd in sides.items():
+            self._ghs[gi] = sd
+        for r in R:
+            for gi in list(self._ghnb_b.get(r, ())):
+                if gi not in whole:
+                    self._ghp.pop((gi, r), None)
+                    self._ghnb_g[gi].discard(r)
+                    self._ghnb_b[r].discard(gi)
+        for (gi, r), v in mine.items():
+            self._ghp[(gi, r)] = v
+            self._ghnb_g[gi].add(r)
+            self._ghnb_b.setdefault(r, set()).add(gi)
+        for n, (X, Y) in tabs.items():
+            refs, idx, _X, _Y, C = self._ghn[n]
+            self._ghn[n] = (refs, idx, X, Y, C)
+        self._ghcen.update(newcen)
+
     def _grid_edges(self):
         g = getattr(self, '_ge', None)
         if g is None or g[0] != (self._nx, self._ny, self.cell):
@@ -1536,15 +1961,22 @@ class Model:
         pads = self.pad_crossings() if self.pw_pad > 0 else 0.0
         lim = self._limits_all()
         ka = self.keep_away_cost() if self.ka else 0.0
-        return {'wire': wire, 'crossings': cross, 'claims': claims, 'decaps': dec,
+        gh = self.group_halo_cost()
+        cost = (wire + self.cw * cross + self.kw * claims + self.dw * dec
+                + self.gw * grp + hint + halo + self.qw * cong + self.pw_pad * pads
+                + self._lw * lim + self.klw * cover + KEEP_AWAY_WEIGHT * ka + self.tw * tmpl)
+        if self.gh_on:
+            cost += gh
+        out = {'wire': wire, 'crossings': cross, 'claims': claims, 'decaps': dec,
                 'groups': grp, 'per_group': per_group, 'hints': hint, 'per_hint': per_hint,
                 'halo': halo, 'congestion': cong, 'pad_hits': pads, 'decap_limits': lim,
                 'decap_broken': self.limits_broken(), 'claim_limits': cover,
                 'claim_broken': self.claims_broken(), 'template': tmpl,
                 'keep_away': ka, 'keep_away_broken': self.keep_away_broken(),
-                'cost': (wire + self.cw * cross + self.kw * claims + self.dw * dec
-                         + self.gw * grp + hint + halo + self.qw * cong + self.pw_pad * pads
-                         + self._lw * lim + self.klw * cover + KEEP_AWAY_WEIGHT * ka + self.tw * tmpl)}
+                'cost': cost}
+        if self.gh_on:      # off: the breakdown as it was
+            out['group_halo'] = gh
+        return out
 
     # -- the intent's decap limits ---------------------------------------------
     # Each term is a MINIMUM over pairs, as the grade measures it: a supply
@@ -2043,6 +2475,7 @@ class Model:
             self._pn.setdefault(n, {})[pid] = w
             self._po.setdefault(pid, {})[n] = w
         self._limits_all()
+        self._gh_build()
         self._pend = None
 
     def halo_pair_fast(self, a, b):
@@ -2218,6 +2651,8 @@ class Model:
             self._pn.setdefault(n, {})[pid] = self._pn.get(n, {}).get(pid, 0.0) + w
             self._po.setdefault(pid, {})[n] = self._po.get(pid, {}).get(n, 0.0) + w
         self._lim_commit(pend)
+        if pend.get('gh') is not None:
+            self._gh_commit(pend['gh'])
         self._pend = None
 
     # -- local pricing of a set of moved parts --------------------------------
@@ -2273,10 +2708,13 @@ class Model:
                 for b in sorted(self._knb.get(r, ())):
                     if b not in rset or b > r:
                         ka += self._kp[(r, b) if r < b else (b, r)]
-            return (wire + self.cw * cross + self.kw * claims + self.dw * dec
-                    + self.gw * grp + hint + halo + self.qw * self.congestion()
-                    + self.pw_pad * pads + self._lw * lim + self.klw * cover + KEEP_AWAY_WEIGHT * ka
-                    + self.tw * tmpl)
+            out = (wire + self.cw * cross + self.kw * claims + self.dw * dec
+                   + self.gw * grp + hint + halo + self.qw * self.congestion()
+                   + self.pw_pad * pads + self._lw * lim + self.klw * cover + KEEP_AWAY_WEIGHT * ka
+                   + self.tw * tmpl)
+            if self.gh_on:
+                out += self._gh_before(R)
+            return out
         ccl = {id(c): self.claim_cost(c) for c in cl}
         cco = {id(c): self.claim_over(c) for c in cl}
         cdc = {k: self.cluster_cost(k) for k in dc}
@@ -2313,14 +2751,18 @@ class Model:
         if ls:
             pend['lim'] = self._lim_local(ls, R)
             lim = sum(self._over_limit(i, v) for i, v in pend['lim'][0].items())
+        gh, pend['gh'] = self._gh_local(R) if self.gh_on else (0.0, None)
         self._pend = pend
         self._moving = frozenset()
-        return (wire + self.cw * cross + self.kw * claims + self.dw * dec
-                + self.gw * sum(groups.values()) + sum(pend['hints'].values())
-                + sum(pend['halo'].values()) + self.qw * self.congestion()
-                + self.pw_pad * pads + self._lw * lim + self.klw * cover
-                + KEEP_AWAY_WEIGHT * sum(pend['ka'].values())
-                + self.tw * sum(ctp.values()))
+        out = (wire + self.cw * cross + self.kw * claims + self.dw * dec
+               + self.gw * sum(groups.values()) + sum(pend['hints'].values())
+               + sum(pend['halo'].values()) + self.qw * self.congestion()
+               + self.pw_pad * pads + self._lw * lim + self.klw * cover
+               + KEEP_AWAY_WEIGHT * sum(pend['ka'].values())
+               + self.tw * sum(ctp.values()))
+        if self.gh_on:
+            out += gh
+        return out
 
     def _group_names(self, gr):
         names = {id(m): name for name, m in self.groups}

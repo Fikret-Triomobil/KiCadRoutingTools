@@ -51,7 +51,8 @@ the same way.
 3. ANNEAL: one cost (`placement/simple.py`) -- signal and rail trees,
    crossings, claims and each claim's `max_mm` limit (a crystal at its
    pins), decaps spread over their own group's supply pins,
-   each group's gap tree, the halo in front of fine-pitch parts' pads,
+   each group's gap tree, the halo in front of fine-pitch parts' pads
+   (and, with --group-halo-coef, in front of each group's sides),
    airwires over foreign pads, routing congestion, and the intent's decap
    limits where it grades them at error -- lowered by simulated
    annealing (`placement/simple_anneal.py`), MOVES_PER_PART moves per
@@ -400,7 +401,12 @@ def build(pcb, board, doc, base, args, intent=None, blocks=None, fixed=(),
                   halo_coef=args.halo_coef, halo_weight=args.halo_weight,
                   claim_limits=limits, claim_limit_weight=args.claim_limit_weight,
                   templates=tmpls, template_weight=args.template_weight,
-                  keep_away=ka_rules)
+                  keep_away=ka_rules, group_halo_coef=args.group_halo_coef,
+                  group_halo_weight=args.group_halo_weight)
+    if model.gh_on:
+        notes.append(f"group halo priced: {len(model._ghg)} group(s), "
+                     f"{args.group_halo_coef:g} mm per escaping net, weight "
+                     f"{args.group_halo_weight:g}")
     if model.ka:
         notes.append(f"keep_away priced: {len(model.ka)} rule(s) over "
                      f"{len(model._ka_parts)} part(s), {KEEP_AWAY_WEIGHT:g} per mm short "
@@ -449,7 +455,8 @@ def _line(t):
             + (f"template {t['template']:.1f} mm, " if t.get('template') else "")
             + (f"{t['decap_broken']} decap limit(s) broken, " if t.get('decap_broken') else "")
             + f"halo {t['halo']:.2f}, "
-            f"pad hits {t['pad_hits']:.0f}, congestion {t['congestion']:.2f}, "
+            + (f"group_halo {t['group_halo']:.2f}, " if 'group_halo' in t else "")
+            + f"pad hits {t['pad_hits']:.0f}, congestion {t['congestion']:.2f}, "
             f"groups {t['groups']:.1f}" + (f": {groups}" if groups else "")
             + f", hints {t['hints']:.1f}" + (f": {hints}" if hints else "") + ")")
 
@@ -1165,6 +1172,11 @@ def build_parser():
                     help='mm of halo per net leaving by a side (default 0.25)')
     ap.add_argument('--halo-weight', type=float, default=10.0,
                     help='cost per mm^2 of a halo shortfall (default 10)')
+    ap.add_argument('--group-halo-coef', type=float, default=0.0,
+                    help="the group halo: mm of escape room in front of a group's "
+                         "side per net leaving the group by it (default 0: off)")
+    ap.add_argument('--group-halo-weight', type=float, default=10.0,
+                    help='cost per mm^2 of a group halo shortfall (default 10)')
     ap.add_argument('--rail-weight', type=float, default=0.3,
                     help='per mm of a supply rail\'s tree: less than a signal\'s 1, '
                          'being wide or poured, but not nothing (default 0.3)')
